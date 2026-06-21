@@ -1,3 +1,8 @@
+# Dependencies allowed to run install scripts (pnpm 11 `allowBuilds`). Without
+# this present at install time, a clean `pnpm install` fails with
+# ERR_PNPM_IGNORED_BUILDS. NOTE: the Dockerfile MUST copy this file into the
+# install layer (it does, alongside package.json/lockfile) or the config is
+# absent during `pnpm install --frozen-lockfile` and the build gate trips.
 allowBuilds:
   electron: true
   electron-winstaller: true

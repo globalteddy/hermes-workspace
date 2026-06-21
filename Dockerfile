@@ -15,8 +15,11 @@ FROM node:22-slim AS build
 RUN corepack enable && apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
-# Install deps (cache-friendly: copy only manifests first)
-COPY package.json pnpm-lock.yaml* ./
+# Install deps (cache-friendly: copy only manifests first).
+# pnpm-workspace.yaml carries `allowBuilds` (which dependency install scripts may
+# run); it must be present here or pnpm 11 fails the clean install with
+# ERR_PNPM_IGNORED_BUILDS.
+COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* ./
 RUN pnpm install --frozen-lockfile
 
 # Copy sources and build
