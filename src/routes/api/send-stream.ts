@@ -29,7 +29,7 @@ import {
   getGatewayCapabilities,
   getMessages as getSessionMessagesFromAgent,
   listSessions,
-  streamChat,
+  streamRun,
 } from '../../server/claude-api'
 import { loadWorkspaceCatalog } from './workspace'
 import {
@@ -201,80 +201,6 @@ function normalizeClaudeErrorMessage(error: unknown): string {
   const message = raw.trim()
   if (!message) return 'Claude request failed'
   return message.replace(/\bserver\b/gi, 'Claude')
-}
-
-function readRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object'
-    ? (value as Record<string, unknown>)
-    : undefined
-}
-
-function getToolName(data: Record<string, unknown>): string {
-  const toolCall = readRecord(data.tool_call)
-  const tool = readRecord(data.tool)
-  const toolFunction = readRecord(toolCall?.function)
-  return (
-    readString(toolCall?.tool_name) ||
-    readString(toolCall?.name) ||
-    readString(toolFunction?.name) ||
-    readString(tool?.name) ||
-    readString(data.tool_name) ||
-    readString(data.name) ||
-    'tool'
-  )
-}
-
-function getToolCallId(
-  data: Record<string, unknown>,
-  runId: string | undefined,
-  toolName: string,
-): string {
-  const toolCall = readRecord(data.tool_call)
-  const tool = readRecord(data.tool)
-  return (
-    readString(toolCall?.id) ||
-    readString(tool?.id) ||
-    readString(data.tool_call_id) ||
-    readString(data.call_id) ||
-    readString(data.id) ||
-    `${runId || 'run'}:${toolName}`
-  )
-}
-
-function parseJsonIfPossible(value: unknown): unknown {
-  if (typeof value !== 'string') return value
-  const trimmed = value.trim()
-  if (!trimmed) return value
-  if (
-    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
-    (trimmed.startsWith('[') && trimmed.endsWith(']'))
-  ) {
-    try {
-      return JSON.parse(trimmed)
-    } catch {
-      return value
-    }
-  }
-  return value
-}
-
-function getToolArgs(data: Record<string, unknown>): unknown {
-  const toolCall = readRecord(data.tool_call)
-  const toolFunction = readRecord(toolCall?.function)
-  return parseJsonIfPossible(
-    toolCall?.arguments ?? toolFunction?.arguments ?? data.args,
-  )
-}
-
-function getToolResultPreview(data: Record<string, unknown>): string {
-  const raw = data.result_preview ?? data.result ?? data.output ?? data.message
-  if (typeof raw === 'string') return raw
-  if (raw === undefined || raw === null) return ''
-  try {
-    return JSON.stringify(raw, null, 2)
-  } catch {
-    return String(raw)
-  }
 }
 
 export const Route = createFileRoute('/api/send-stream')({
@@ -592,6 +518,192 @@ export const Route = createFileRoute('/api/send-stream')({
                       content: userContent,
                     },
                   ]
+
+                  // #641: Vanilla hermes-agent (zero-fork) resolves to chatMode
+                  // 'portable', but its /v1/chat/completions surface cannot
+                  // carry tool/command approval requests — a flagged command
+                  // silently fails and the agent confabulates. The native
+                  // /v1/runs API DOES emit approval.request, so when we are
+                  // talking to the hermes gateway (not a local OpenAI model) and
+                  // there are no image attachments (which /v1/runs can't take as
+                  // multimodal input), drive the run through /v1/runs so the
+                  // approval card can render. Falls back to openaiChat on error.
+                  const useRunsApi =
+                    !localBaseUrl && (!attachments || attachments.length === 0)
+                  if (useRunsApi) {
+                    let accumulated = ''
+                    const localInstructions =
+                      localeSystemMsg.length > 0 &&
+                      typeof localeSystemMsg[0].content === 'string'
+                        ? (localeSystemMsg[0].content as string)
+                        : undefined
+                    let runToolSeq = 0
+                    const runToolIds = new Map<string, string>()
+                    try {
+                      await streamRun(
+                        {
+                          input: scopedMessage,
+                          conversation_history: effectiveHistory.map((m) => ({
+                            role: m.role,
+                            content:
+                              typeof m.content === 'string'
+                                ? m.content
+                                : JSON.stringify(m.content),
+                          })),
+                          instructions: localInstructions,
+                          model:
+                            typeof body.model === 'string'
+                              ? body.model
+                              : undefined,
+                        },
+                        {
+                          signal: abortController.signal,
+                          onRunId() {
+                            // The client already has the portable runId from the
+                            // 'started' event; the backend run id is only needed
+                            // for approval resolution and rides on each event.
+                          },
+                          async onEvent({ event, data }) {
+                            const backendRunId =
+                              typeof data.run_id === 'string' && data.run_id
+                                ? data.run_id
+                                : runId
+                            if (event === 'approval.request') {
+                              const choices = Array.isArray(data.choices)
+                                ? (data.choices.filter(
+                                    (c) => typeof c === 'string',
+                                  ) as Array<string>)
+                                : ['once', 'deny']
+                              sendEvent('approval', {
+                                runId: backendRunId,
+                                command: readString(data.command),
+                                description: readString(data.description),
+                                patternKey: readString(data.pattern_key),
+                                choices,
+                                sessionKey: portableSessionKey,
+                              })
+                              lastActivity = 'Waiting for approval…'
+                              return
+                            }
+                            if (event === 'message.delta') {
+                              const delta =
+                                typeof data.delta === 'string' ? data.delta : ''
+                              if (!delta) return
+                              accumulated += delta
+                              sendEvent('chunk', {
+                                text: accumulated,
+                                fullReplace: true,
+                                sessionKey: portableSessionKey,
+                                runId,
+                              })
+                              return
+                            }
+                            if (event === 'reasoning.available') {
+                              const text =
+                                typeof data.text === 'string' ? data.text : ''
+                              if (!text) return
+                              sendEvent('thinking', {
+                                text,
+                                sessionKey: portableSessionKey,
+                                runId,
+                              })
+                              return
+                            }
+                            if (event === 'tool.started') {
+                              const toolName = readString(data.tool) || 'tool'
+                              const id = `${runId}:${toolName}:${++runToolSeq}`
+                              runToolIds.set(toolName, id)
+                              sendEvent('tool', {
+                                phase: 'calling',
+                                name: toolName,
+                                toolCallId: id,
+                                preview:
+                                  typeof data.preview === 'string'
+                                    ? data.preview
+                                    : undefined,
+                                sessionKey: portableSessionKey,
+                                runId,
+                              })
+                              lastActivity = `Running: ${toolName.replace(/_/g, ' ')}`
+                              return
+                            }
+                            if (event === 'tool.completed') {
+                              const toolName = readString(data.tool) || 'tool'
+                              const id =
+                                runToolIds.get(toolName) ||
+                                `${runId}:${toolName}`
+                              sendEvent('tool', {
+                                phase: data.error ? 'error' : 'complete',
+                                name: toolName,
+                                toolCallId: id,
+                                sessionKey: portableSessionKey,
+                                runId,
+                              })
+                              return
+                            }
+                            if (event === 'error') {
+                              const msg =
+                                readString(
+                                  (
+                                    data.error as
+                                      | Record<string, unknown>
+                                      | undefined
+                                  )?.message,
+                                ) ||
+                                readString(data.message) ||
+                                'Hermes run error'
+                              throw new Error(msg)
+                            }
+                            if (event === 'run.completed') {
+                              const finalOutput =
+                                typeof data.output === 'string'
+                                  ? data.output
+                                  : ''
+                              if (finalOutput && !accumulated) {
+                                accumulated = finalOutput
+                                sendEvent('chunk', {
+                                  text: accumulated,
+                                  fullReplace: true,
+                                  sessionKey: portableSessionKey,
+                                  runId,
+                                })
+                              }
+                            }
+                          },
+                        },
+                      )
+                      appendLocalMessage(portableSessionKey, {
+                        id: crypto.randomUUID(),
+                        role: 'assistant',
+                        content: accumulated,
+                        timestamp: Date.now(),
+                      })
+                      touchLocalSession(portableSessionKey)
+                      persistActiveRun((runSessionKey, activeId) =>
+                        markRunStatus(runSessionKey, activeId, 'complete'),
+                      )
+                      sendEvent('done', {
+                        state: 'complete',
+                        sessionKey: portableSessionKey,
+                        runId,
+                        message: {
+                          role: 'assistant',
+                          content: [{ type: 'text', text: accumulated }],
+                        },
+                      })
+                      closeStream()
+                      return
+                    } catch (err) {
+                      // Any /v1/runs failure falls through to the openaiChat
+                      // path so chat keeps working (older agent, transient blip).
+                      console.warn(
+                        '[send-stream] /v1/runs path failed, falling back to /v1/chat/completions:',
+                        err,
+                      )
+                      accumulated = ''
+                    }
+                  }
+
                   // Vanilla Hermes Agent (>=v0.12.x) ships a structured
                   // Responses-API streaming surface at POST /v1/responses
                   // that carries full tool args + results, unlike the
@@ -949,11 +1061,35 @@ export const Route = createFileRoute('/api/send-stream')({
               // tool_calls" can resolve to the previous turn, surfacing stale
               // tool cards (off-by-one-turn bug).
               let liveBaselineCount = 0
+              // Conversation history to seed the /v1/runs call. Unlike the
+              // chat/stream path (which loads history server-side from the
+              // session), /v1/runs uses the request-supplied history as the
+              // authoritative LLM context — so we replay the session's prior
+              // user/assistant/system turns here to preserve continuity.
+              let conversationHistory: Array<{ role: string; content: string }> = []
               try {
                 const baseline = (await getSessionMessagesFromAgent(
                   sessionKey,
                 )) as unknown as Array<Record<string, unknown>>
-                if (Array.isArray(baseline)) liveBaselineCount = baseline.length
+                if (Array.isArray(baseline)) {
+                  liveBaselineCount = baseline.length
+                  conversationHistory = baseline
+                    .filter((m) => {
+                      const role = readString(m.role)
+                      const content = m.content
+                      return (
+                        (role === 'user' ||
+                          role === 'assistant' ||
+                          role === 'system') &&
+                        typeof content === 'string' &&
+                        content.trim().length > 0
+                      )
+                    })
+                    .map((m) => ({
+                      role: readString(m.role),
+                      content: m.content as string,
+                    }))
+                }
               } catch {
                 liveBaselineCount = 0
               }
@@ -1006,352 +1142,112 @@ export const Route = createFileRoute('/api/send-stream')({
               })()
 
               try {
-                await streamChat(
-                sessionKey,
+                await streamRun(
                 {
-                  message: scopedMessage,
+                  input: scopedMessage,
+                  session_id: sessionKey,
+                  conversation_history: conversationHistory,
+                  instructions: thinking || undefined,
                   model:
                     typeof body.model === 'string' ? body.model : undefined,
-                  system_message: thinking,
-                  attachments: attachments || undefined,
                 },
                 {
                   signal: abortController.signal,
+                  onRunId(runId) {
+                    if (!runId || activeRunId) return
+                    activeRunId = runId
+                    registerActiveSendRun(runId)
+                    persistRunStarted(runId, sessionKey, sessionKey)
+                    unregisterTimer = setTimeout(() => {
+                      if (activeRunId) {
+                        unregisterActiveSendRun(activeRunId)
+                        activeRunId = null
+                      }
+                    }, SEND_STREAM_RUN_TIMEOUT_MS)
+                    if (!startedSent) {
+                      startedSent = true
+                      sendEvent('started', {
+                        runId,
+                        sessionKey,
+                        friendlyId: sessionKey,
+                      })
+                      lastActivity = 'Processing your message...'
+                    }
+                  },
                   async onEvent({ event, data }) {
-                    const sessionKeyFromEvent =
-                      typeof data.session_id === 'string' &&
-                      data.session_id.trim()
-                        ? data.session_id
-                        : sessionKey
+                    const sessionKeyFromEvent = sessionKey
                     const runId =
                       typeof data.run_id === 'string' && data.run_id.trim()
                         ? data.run_id
                         : (activeRunId ?? undefined)
 
-                    if (runId && !activeRunId) {
-                      activeRunId = runId
-                      registerActiveSendRun(runId)
-                      persistRunStarted(
-                        runId,
-                        sessionKeyFromEvent,
-                        sessionKeyFromEvent,
-                      )
-                      unregisterTimer = setTimeout(() => {
-                        if (activeRunId) {
-                          unregisterActiveSendRun(activeRunId)
-                          activeRunId = null
-                        }
-                      }, SEND_STREAM_RUN_TIMEOUT_MS)
-                    }
-
-                    if (!startedSent && runId) {
-                      startedSent = true
-                      sendEvent('started', {
-                        runId,
+                    // ── Approval gate (#641): the reason we use /v1/runs. The
+                    // chat/stream path never emits this event, so flagged
+                    // commands fail instantly there with no card. ──
+                    if (event === 'approval.request') {
+                      const choices = Array.isArray(data.choices)
+                        ? (data.choices.filter(
+                            (c) => typeof c === 'string',
+                          ) as Array<string>)
+                        : ['once', 'deny']
+                      sendEvent('approval', {
+                        runId: runId ?? activeRunId ?? '',
+                        command: readString(data.command),
+                        description: readString(data.description),
+                        patternKey: readString(data.pattern_key),
+                        choices,
                         sessionKey: sessionKeyFromEvent,
-                        friendlyId: sessionKeyFromEvent,
                       })
-                      lastActivity = 'Processing your message...'
-                    }
-
-                    if (event === 'run.started') {
-                      const userMessage =
-                        data.user_message &&
-                        typeof data.user_message === 'object'
-                          ? (data.user_message as Record<string, unknown>)
-                          : null
-                      if (userMessage) {
-                        skipPublish ||
-                          publishChatEvent('user_message', {
-                            message: {
-                              id: userMessage.id,
-                              role: userMessage.role ?? 'user',
-                              content: [
-                                {
-                                  type: 'text',
-                                  text:
-                                    typeof userMessage.content === 'string'
-                                      ? userMessage.content
-                                      : '',
-                                },
-                              ],
-                            },
-                            sessionKey: sessionKeyFromEvent,
-                            source: 'claude',
-                            runId,
-                          })
-                      }
+                      lastActivity = 'Waiting for approval…'
                       return
                     }
 
-                    if (event === 'message.started') {
-                      const message =
-                        data.message && typeof data.message === 'object'
-                          ? (data.message as Record<string, unknown>)
-                          : {}
-                      const translated = {
-                        message: {
-                          id: message.id,
-                          role: 'assistant',
-                          content: [],
-                        },
-                        sessionKey: sessionKeyFromEvent,
-                        runId,
-                      }
-                      sendEvent('message', translated)
-                      skipPublish || publishChatEvent('message', translated)
-                      return
-                    }
-
-                    if (event === 'assistant.completed') {
-                      // Send full content as a chunk — covers cases where
-                      // deltas were missed or response was too short for streaming
-                      const content =
-                        typeof data.content === 'string' ? data.content : ''
-                      if (content) {
-                        persistActiveRun((runSessionKey, activeId) =>
-                          appendRunText(runSessionKey, activeId, content, {
-                            replace: true,
-                          }),
-                        )
-                        const translated = {
-                          text: content,
-                          fullReplace: true,
-                          sessionKey: sessionKeyFromEvent,
-                          runId,
-                        }
-                        sendEvent('chunk', translated)
-                        skipPublish || publishChatEvent('chunk', translated)
-                      }
-                      return
-                    }
-
-                    if (event === 'assistant.delta') {
+                    if (event === 'message.delta') {
                       const delta =
                         typeof data.delta === 'string' ? data.delta : ''
                       if (!delta) return
                       persistActiveRun((runSessionKey, activeId) =>
                         appendRunText(runSessionKey, activeId, delta),
                       )
-                      const translated = {
+                      sendEvent('chunk', {
                         text: delta,
                         sessionKey: sessionKeyFromEvent,
                         runId,
-                      }
-                      sendEvent('chunk', translated)
-                      skipPublish || publishChatEvent('chunk', translated)
+                      })
                       return
                     }
 
-                    if (
-                      event === 'tool.pending' ||
-                      event === 'tool.started' ||
-                      event === 'tool.calling' ||
-                      event === 'tool.running'
-                    ) {
-                      const toolName = getToolName(data)
-                      const preview =
-                        typeof data.preview === 'string'
-                          ? data.preview
-                          : undefined
-                      const translated = {
-                        phase:
-                          event === 'tool.pending' || event === 'tool.started'
-                            ? 'start'
-                            : 'calling',
-                        name: toolName,
-                        toolCallId: getToolCallId(data, runId, toolName),
-                        args: getToolArgs(data),
-                        preview,
+                    if (event === 'reasoning.available') {
+                      const text =
+                        typeof data.text === 'string' ? data.text : ''
+                      if (!text) return
+                      persistActiveRun((runSessionKey, activeId) =>
+                        setRunThinking(runSessionKey, activeId, text),
+                      )
+                      sendEvent('thinking', {
+                        text,
                         sessionKey: sessionKeyFromEvent,
                         runId,
-                      }
-                      persistActiveRun((runSessionKey, activeId) =>
-                        upsertRunToolCall(runSessionKey, activeId, {
-                          id: translated.toolCallId,
-                          name: toolName,
-                          phase: translated.phase,
-                          args: translated.args,
-                          preview,
-                        }),
-                      )
-                      sendEvent('tool', translated)
-                      skipPublish || publishChatEvent('tool', translated)
+                      })
+                      lastActivity =
+                        text.length > 60 ? text.slice(0, 60) + '...' : text
+                      return
+                    }
+
+                    // Tool cards come from the synthetic poller + the
+                    // run.completed backfill (which carry args/results that the
+                    // /v1/runs tool.* events lack). Emitting cards here too
+                    // would duplicate rows, so we only refresh the live
+                    // activity label for the thinking bubble.
+                    if (event === 'tool.started') {
+                      const toolName = readString(data.tool) || 'tool'
                       lastActivity = `Running: ${toolName.replace(/_/g, ' ')}`
                       return
                     }
 
-                    if (event === 'tool.progress') {
-                      const delta = readString(data.delta)
-                      const toolName = getToolName(data)
-                      if (toolName === '_thinking' || toolName === 'tool') {
-                        if (!delta) return
-                        persistActiveRun((runSessionKey, activeId) =>
-                          setRunThinking(runSessionKey, activeId, delta),
-                        )
-                        const translated = {
-                          text: delta,
-                          sessionKey: sessionKeyFromEvent,
-                          runId,
-                        }
-                        sendEvent('thinking', translated)
-                        skipPublish || publishChatEvent('thinking', translated)
-                        lastActivity = delta.length > 60 ? delta.slice(0, 60) + '...' : delta
-                        return
-                      }
-                      const translated = {
-                        phase: 'calling',
-                        name: toolName,
-                        toolCallId: getToolCallId(data, runId, toolName),
-                        args: getToolArgs(data),
-                        result: delta || undefined,
-                        sessionKey: sessionKeyFromEvent,
-                        runId,
-                      }
-                      persistActiveRun((runSessionKey, activeId) =>
-                        upsertRunToolCall(runSessionKey, activeId, {
-                          id: translated.toolCallId,
-                          name: toolName,
-                          phase: 'calling',
-                          args: translated.args,
-                          result: translated.result,
-                        }),
-                      )
-                      sendEvent('tool', translated)
-                      skipPublish || publishChatEvent('tool', translated)
-                      return
-                    }
-
                     if (event === 'tool.completed') {
-                      const toolName = getToolName(data)
-                      const resultPreview = getToolResultPreview(data)
-                      const translated = {
-                        phase: 'complete',
-                        name: toolName,
-                        toolCallId: getToolCallId(data, runId, toolName),
-                        args: getToolArgs(data),
-                        result: resultPreview.slice(0, 4000),
-                        sessionKey: sessionKeyFromEvent,
-                        runId,
-                      }
-                      persistActiveRun((runSessionKey, activeId) =>
-                        upsertRunToolCall(runSessionKey, activeId, {
-                          id: translated.toolCallId,
-                          name: toolName,
-                          phase: 'complete',
-                          args: translated.args,
-                          result: translated.result,
-                        }),
-                      )
-                      sendEvent('tool', translated)
-                      skipPublish || publishChatEvent('tool', translated)
+                      const toolName = readString(data.tool) || 'tool'
                       lastActivity = `Completed: ${toolName.replace(/_/g, ' ')}`
-                      return
-                    }
-
-                    if (event === 'artifact.created') {
-                      const artifact =
-                        data.artifact && typeof data.artifact === 'object'
-                          ? (data.artifact as Record<string, unknown>)
-                          : {}
-                      const translated = {
-                        name: readString(data.tool_name) || 'artifact',
-                        title:
-                          readString(artifact.title) ||
-                          readString(data.title) ||
-                          'Artifact created',
-                        kind:
-                          readString(artifact.kind) ||
-                          readString(data.kind) ||
-                          'artifact',
-                        path:
-                          readString(artifact.path) || readString(data.path) || '',
-                        sessionKey: sessionKeyFromEvent,
-                        runId,
-                      }
-                      sendEvent('artifact', translated)
-                      skipPublish || publishChatEvent('artifact', translated)
-                      return
-                    }
-
-                    if (event === 'memory.updated') {
-                      const translated = {
-                        phase: 'complete',
-                        name: 'memory',
-                        toolCallId: readString(data.tool_call_id) || undefined,
-                        result:
-                          readString(data.message) ||
-                          `Updated ${readString(data.target) || 'memory'}`,
-                        sessionKey: sessionKeyFromEvent,
-                        runId,
-                      }
-                      persistActiveRun((runSessionKey, activeId) =>
-                        upsertRunToolCall(runSessionKey, activeId, {
-                          id: translated.toolCallId || `${runId || 'run'}:memory`,
-                          name: 'memory',
-                          phase: 'complete',
-                          result: translated.result,
-                        }),
-                      )
-                      sendEvent('tool', translated)
-                      skipPublish || publishChatEvent('tool', translated)
-                      return
-                    }
-
-                    if (event === 'skill.loaded') {
-                      const skill =
-                        data.skill && typeof data.skill === 'object'
-                          ? (data.skill as Record<string, unknown>)
-                          : {}
-                      const translated = {
-                        phase: 'complete',
-                        name: 'skill',
-                        toolCallId: readString(data.tool_call_id) || undefined,
-                        result:
-                          readString(skill.name) ||
-                          readString(data.skill_name) ||
-                          'Skill loaded',
-                        sessionKey: sessionKeyFromEvent,
-                        runId,
-                      }
-                      persistActiveRun((runSessionKey, activeId) =>
-                        upsertRunToolCall(runSessionKey, activeId, {
-                          id: translated.toolCallId || `${runId || 'run'}:skill`,
-                          name: 'skill',
-                          phase: 'complete',
-                          result: translated.result,
-                        }),
-                      )
-                      sendEvent('tool', translated)
-                      skipPublish || publishChatEvent('tool', translated)
-                      return
-                    }
-
-                    if (event === 'tool.failed') {
-                      const errorMessage =
-                        readString(
-                          (data.error as Record<string, unknown> | undefined)
-                            ?.message,
-                        ) || readString(data.message)
-                      const toolName = getToolName(data)
-                      const translated = {
-                        phase: 'error',
-                        name: toolName,
-                        toolCallId: getToolCallId(data, runId, toolName),
-                        result: errorMessage,
-                        sessionKey: sessionKeyFromEvent,
-                        runId,
-                      }
-                      persistActiveRun((runSessionKey, activeId) =>
-                        upsertRunToolCall(runSessionKey, activeId, {
-                          id: translated.toolCallId,
-                          name: toolName,
-                          phase: 'error',
-                          result: translated.result,
-                        }),
-                      )
-                      sendEvent('tool', translated)
-                      skipPublish || publishChatEvent('tool', translated)
                       return
                     }
 
@@ -1474,6 +1370,25 @@ export const Route = createFileRoute('/api/send-stream')({
                           '[send-stream] tool backfill failed:',
                           err,
                         )
+                      }
+
+                      // /v1/runs carries the final assistant text on
+                      // run.completed; emit it as a full-replace chunk so the
+                      // bubble is never empty if streaming deltas were missed.
+                      const finalOutput =
+                        typeof data.output === 'string' ? data.output : ''
+                      if (finalOutput) {
+                        persistActiveRun((runSessionKey, activeId) =>
+                          appendRunText(runSessionKey, activeId, finalOutput, {
+                            replace: true,
+                          }),
+                        )
+                        sendEvent('chunk', {
+                          text: finalOutput,
+                          fullReplace: true,
+                          sessionKey: sessionKeyFromEvent,
+                          runId,
+                        })
                       }
 
                       const translated = {

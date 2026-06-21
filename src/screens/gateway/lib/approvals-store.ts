@@ -11,6 +11,10 @@ export type ApprovalRequest = {
   source?: 'agent' | 'gateway'
   /** Raw gateway approval ID for resolving via the gateway API */
   gatewayApprovalId?: string
+  /** Hermes run id for chat-stream approvals; resolved via POST /api/runs/{runId}/approval (#641) */
+  runId?: string
+  /** Allowed resolution choices from the backend, e.g. ['once','session','always','deny'] */
+  choices?: Array<string>
 }
 
 const APPROVALS_KEY = 'clawsuite:approvals'

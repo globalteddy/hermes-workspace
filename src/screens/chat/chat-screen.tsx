@@ -708,68 +708,8 @@ export function ChatScreen({
       setWaitingForResponse(true)
       setPendingGeneration(true)
     }, []),
-    onApprovalRequest: useCallback((payload: Record<string, unknown>) => {
-      const approvalId =
-        typeof payload.id === 'string'
-          ? payload.id
-          : typeof payload.approvalId === 'string'
-            ? payload.approvalId
-            : typeof payload.approvalId === 'string'
-              ? payload.approvalId
-              : ''
-
-      const currentApprovals = loadApprovals()
-      if (
-        approvalId &&
-        currentApprovals.some((entry) => {
-          return entry.status === 'pending' && entry.gatewayApprovalId === approvalId
-        })
-      ) {
-        setPendingApprovals(
-          currentApprovals.filter((entry) => entry.status === 'pending'),
-        )
-        return
-      }
-
-      const actionValue = payload.action ?? payload.tool ?? payload.command
-      const action =
-        typeof actionValue === 'string'
-          ? actionValue
-          : actionValue
-            ? JSON.stringify(actionValue)
-            : 'Tool call requires approval'
-      const contextValue = payload.context ?? payload.input ?? payload.args
-      const context =
-        typeof contextValue === 'string'
-          ? contextValue
-          : contextValue
-            ? JSON.stringify(contextValue)
-            : ''
-      const agentNameValue =
-        payload.agentName ?? payload.agent ?? payload.source
-      const agentName =
-        typeof agentNameValue === 'string' && agentNameValue.trim().length > 0
-          ? agentNameValue
-          : 'Agent'
-      const agentIdValue =
-        payload.agentId ?? payload.sessionKey ?? payload.source
-      const agentId =
-        typeof agentIdValue === 'string' && agentIdValue.trim().length > 0
-          ? agentIdValue
-          : 'claude'
-
-      addApproval({
-        agentId,
-        agentName,
-        action,
-        context,
-        source: 'agent',
-        gatewayApprovalId: approvalId || undefined,
-      })
-      setPendingApprovals(
-        loadApprovals().filter((entry) => entry.status === 'pending'),
-      )
-    }, []),
+    // Approval requests are handled on the live useStreamingMessage path
+    // (onApprovalRequest below); the realtime-history path is a no-op stub.
     onCompactionStart: useCallback(() => {
       setIsCompacting(true)
     }, []),
@@ -838,12 +778,15 @@ export function ChatScreen({
   }, [])
 
   const resolvePendingApproval = useCallback(
-    async (approval: ApprovalRequest, status: 'approved' | 'denied') => {
+    async (approval: ApprovalRequest, choice: string) => {
+      // choice is a backend resolution token: once | session | always | deny.
+      const localStatus: 'approved' | 'denied' =
+        choice === 'deny' ? 'denied' : 'approved'
       const nextApprovals = loadApprovals().map((entry) => {
         if (entry.id !== approval.id) return entry
         return {
           ...entry,
-          status,
+          status: localStatus,
           resolvedAt: Date.now(),
         }
       })
@@ -851,10 +794,27 @@ export function ChatScreen({
       setPendingApprovals(
         nextApprovals.filter((entry) => entry.status === 'pending'),
       )
-      if (!approval.gatewayApprovalId) return
 
+      // Chat-run approvals (#641) resolve through the run approval proxy,
+      // which injects the API key and forwards to /v1/runs/{id}/approval.
+      if (approval.runId) {
+        try {
+          await fetch(`/api/runs/${approval.runId}/approval`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ choice }),
+          })
+        } catch {
+          // Local resolution still applied; the agent will time out and block
+          // if the decision never lands, which is the safe default.
+        }
+        return
+      }
+
+      // Legacy gateway approvals path (kept for back-compat).
+      if (!approval.gatewayApprovalId) return
       const endpoint =
-        status === 'approved'
+        localStatus === 'approved'
           ? `/api/approvals/${approval.gatewayApprovalId}/approve`
           : `/api/approvals/${approval.gatewayApprovalId}/deny`
       try {
@@ -1156,6 +1116,42 @@ export function ChatScreen({
       },
       [activeFriendlyId, onSessionResolved],
     ),
+    onApprovalRequest: useCallback((payload: Record<string, unknown>) => {
+      // #641: backend asked for a tool/command approval during this chat run.
+      // The /api/send-stream BFF re-frames the /v1/runs approval event to:
+      // { runId, command, description, choices }. Surface it as a pending
+      // approval card; it resolves via POST /api/runs/{runId}/approval.
+      const runId = typeof payload.runId === 'string' ? payload.runId : ''
+      if (!runId) return
+      const command =
+        typeof payload.command === 'string' ? payload.command : ''
+      const description =
+        typeof payload.description === 'string' ? payload.description : ''
+      const choices = Array.isArray(payload.choices)
+        ? (payload.choices.filter(
+            (c): c is string => typeof c === 'string',
+          ) as Array<string>)
+        : ['once', 'deny']
+
+      const existing = loadApprovals()
+      // Dedupe on runId so repeated frames for the same run don't stack.
+      if (existing.some((e) => e.status === 'pending' && e.runId === runId)) {
+        setPendingApprovals(existing.filter((e) => e.status === 'pending'))
+        return
+      }
+      addApproval({
+        agentId: 'nyx',
+        agentName: 'Nyx',
+        action: description || command || 'Tool call requires approval',
+        context: command,
+        source: 'agent',
+        runId,
+        choices,
+      })
+      setPendingApprovals(
+        loadApprovals().filter((e) => e.status === 'pending'),
+      )
+    }, []),
     onStarted: useCallback(
       ({ runId }: { runId: string | null }) => {
         const activeSend = activeSendRef.current
@@ -2813,25 +2809,46 @@ export function ChatScreen({
                         </p>
                       ) : null}
                     </div>
-                    <div className="flex shrink-0 gap-2">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void resolvePendingApproval(approval, 'approved')
-                        }}
-                        className="rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-600"
-                      >
-                        Approve
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void resolvePendingApproval(approval, 'denied')
-                        }}
-                        className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 dark:border-red-800/50 dark:bg-red-900/10 dark:text-red-400"
-                      >
-                        Deny
-                      </button>
+                    <div className="flex shrink-0 flex-wrap gap-2">
+                      {(approval.choices && approval.choices.length > 0
+                        ? approval.choices
+                        : ['once', 'deny']
+                      ).map((choice) => {
+                        const isDeny = choice === 'deny'
+                        const label =
+                          choice === 'once'
+                            ? 'Approve'
+                            : choice === 'session'
+                              ? 'Session'
+                              : choice === 'always'
+                                ? 'Always'
+                                : isDeny
+                                  ? 'Deny'
+                                  : choice
+                        const title =
+                          choice === 'session'
+                            ? 'Allow for the rest of this session'
+                            : choice === 'always'
+                              ? 'Always allow this command'
+                              : undefined
+                        return (
+                          <button
+                            key={choice}
+                            type="button"
+                            title={title}
+                            onClick={() => {
+                              void resolvePendingApproval(approval, choice)
+                            }}
+                            className={
+                              isDeny
+                                ? 'rounded-lg border border-red-200 bg-white px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 dark:border-red-800/50 dark:bg-red-900/10 dark:text-red-400'
+                                : 'rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-600'
+                            }
+                          >
+                            {label}
+                          </button>
+                        )
+                      })}
                     </div>
                   </div>
                 ))}

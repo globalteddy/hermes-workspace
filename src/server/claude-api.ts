@@ -468,6 +468,118 @@ export async function streamChat(
   }
 }
 
+// ── Structured runs (/v1/runs) — the ONLY backend path that emits approval
+// events. The chat/stream path never registers an approval notifier, so a
+// flagged command there fails instantly and the agent confabulates (#641).
+// We drive enhanced-mode chat through /v1/runs so approval.request reaches us.
+
+type StreamRunBody = {
+  input: string
+  session_id?: string
+  conversation_history?: Array<{ role: string; content: string }>
+  instructions?: string
+  model?: string
+}
+
+type StreamRunOptions = {
+  signal?: AbortSignal
+  /** Fired once with the run_id as soon as POST /v1/runs returns. */
+  onRunId?: (runId: string) => void
+  /**
+   * Fired for every event on GET /v1/runs/{id}/events. Unlike chat/stream,
+   * this surface frames events as bare `data: {json}` with the discriminant
+   * in the JSON `event` field (no SSE `event:` line). `event` is normalized
+   * to that field here so callers can switch on it just like streamChat.
+   */
+  onEvent: (payload: {
+    event: string
+    data: Record<string, unknown>
+  }) => void | Promise<void>
+}
+
+/**
+ * Start a structured run and stream its lifecycle events.
+ *
+ * Two HTTP calls: POST /v1/runs returns a run_id immediately (202), then
+ * GET /v1/runs/{run_id}/events drains the run's SSE queue until the run
+ * finishes. Binding `session_id` keeps the run on the user's existing
+ * persisted session (so chat history is preserved) and scopes approvals.
+ */
+export async function streamRun(
+  body: StreamRunBody,
+  opts: StreamRunOptions,
+): Promise<void> {
+  const startRes = await fetch(`${CLAUDE_API}/v1/runs`, {
+    method: 'POST',
+    headers: { ..._authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: opts.signal,
+  })
+
+  if (!startRes.ok) {
+    const text = await startRes.text().catch(() => '')
+    throw new Error(`Hermes run start: ${startRes.status} ${text}`)
+  }
+
+  const startJson = (await startRes.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >
+  const runId =
+    (typeof startJson.id === 'string' && startJson.id) ||
+    (typeof startJson.run_id === 'string' && startJson.run_id) ||
+    ''
+  if (!runId) {
+    throw new Error('Hermes run start: response missing run id')
+  }
+  opts.onRunId?.(runId)
+
+  const eventsRes = await fetch(
+    `${CLAUDE_API}/v1/runs/${encodeURIComponent(runId)}/events`,
+    {
+      method: 'GET',
+      headers: { ..._authHeaders() },
+      signal: opts.signal,
+    },
+  )
+
+  if (!eventsRes.ok) {
+    const text = await eventsRes.text().catch(() => '')
+    throw new Error(`Hermes run events: ${eventsRes.status} ${text}`)
+  }
+
+  const reader = eventsRes.body?.getReader()
+  if (!reader) throw new Error('No response body')
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      // The run-events stream uses bare `data:` frames; `:`-prefixed lines
+      // (`: keepalive`, `: stream closed`) are SSE comments — ignore them.
+      if (!line.startsWith('data:')) continue
+      const dataStr = line.slice(line.startsWith('data: ') ? 6 : 5)
+      if (!dataStr || dataStr === '[DONE]') continue
+      try {
+        const data = JSON.parse(dataStr) as Record<string, unknown>
+        const event =
+          typeof data.event === 'string' && data.event ? data.event : 'message'
+        await opts.onEvent({ event, data })
+      } catch {
+        // skip malformed JSON
+      }
+    }
+  }
+}
+
 /** Non-streaming chat */
 export async function sendChat(
   sessionId: string,

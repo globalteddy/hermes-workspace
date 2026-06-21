@@ -88,6 +88,12 @@ type UseStreamingMessageOptions = {
     sessionKey: string
     friendlyId: string
   }) => void
+  /**
+   * Fired when the backend requests a tool/command approval mid-run (#641).
+   * The payload carries { runId, command, description, choices, ... } as
+   * re-framed by the /api/send-stream BFF from the /v1/runs approval event.
+   */
+  onApprovalRequest?: (approval: Record<string, unknown>) => void
   acceptedTimeoutMs?: number
   handoffTimeoutMs?: number
 }
@@ -104,6 +110,7 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
     onMessageAccepted,
     onAbort,
     onSessionResolved,
+    onApprovalRequest,
     acceptedTimeoutMs,
     handoffTimeoutMs,
   } = options
@@ -698,6 +705,15 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
           stepUsageRef.current = nextUsage
           break
         }
+        case 'approval': {
+          // #641: backend requested a tool/command approval mid-run. Keep the
+          // stream alive (mark activity so the no-progress timer doesn't fire)
+          // and hand the payload to chat-screen, which renders the card and
+          // resolves via POST /api/runs/{runId}/approval.
+          markActivity()
+          onApprovalRequest?.(payload)
+          break
+        }
         case 'done': {
           const doneState = (payload as { state?: string }).state
           const errorMessage = (payload as { errorMessage?: string })
@@ -781,6 +797,7 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
       markFailed,
       onStarted,
       onSessionResolved,
+      onApprovalRequest,
       onThinking,
       onTool,
       markActivity,
